@@ -1,0 +1,850 @@
+module  i2c_timing_ctrl_reg16_dat8_wronly
+#(
+    parameter   CLK_FREQ    =   100_000000, //100 MHz
+    parameter   I2C_FREQ    =   400_000     //10 KHz(< 400KHz)
+)
+(
+    //global clock
+    input               clk,                //100MHz
+    input               rst_n,              //system reset
+            
+    //i2c interface     
+    output              i2c_sclk,           //i2c clock
+//    inout               i2c_sdat,           //i2c data for bidirection
+    input               i2c_sdat_i,
+    output              i2c_sdat_o,
+    output              i2c_sdat_oe,
+    //user interface
+    input       [7:0]   i2c_config_size,    //i2c config data counte
+    output  reg [7:0]   i2c_config_index,   //i2c config reg index, read 2 reg and write xx reg
+    input       [31:0]  i2c_config_data,    //i2c config data
+    output              i2c_config_done    //i2c config timing complete
+);
+
+//----------------------------------------
+//Delay xxus until i2c slave is steady
+reg [19:0]  delay_cnt;
+//localparam  DELAY_TOP = SIMU_EN ? 20'hff : CLK_FREQ/1000;  //1ms Setting time after software/hardware reset
+localparam  DELAY_TOP = CLK_FREQ/1000;  //1ms Setting time after software/hardware reset
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        delay_cnt <= 0;
+    else if(delay_cnt < DELAY_TOP)
+        delay_cnt <= delay_cnt + 1'b1;
+    else
+        delay_cnt <= delay_cnt;
+end
+wire    delay_done = (delay_cnt == DELAY_TOP) ? 1'b1 : 1'b0;    //81us delay
+
+
+//----------------------------------------
+//I2C Control Clock generate
+reg [15:0]  clk_cnt;    //divide for i2c clock
+/******************************************
+             _______          _______
+SCLK    ____|       |________|       |
+         ________________ ______________
+SDAT    |________________|______________
+         _                _
+CLK_EN  | |______________| |____________
+                _                _
+CAP_EN  _______| |______________| |_____
+*******************************************/
+reg i2c_ctrl_clk;       //i2c control clock, H: valid; L: valid
+reg i2c_transfer_en;    //send i2c data before, make sure that sdat is steady when i2c_sclk is valid
+reg i2c_capture_en;     //capture i2c data  while sdat is steady from cmos              
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        begin
+        clk_cnt <= 0;
+        i2c_ctrl_clk <= 0;
+        i2c_transfer_en <= 0;
+        i2c_capture_en <= 0;
+        end
+    else if(delay_done)
+        begin
+        if(clk_cnt < (CLK_FREQ/I2C_FREQ) - 1'b1)
+            clk_cnt <= clk_cnt + 1'd1;
+        else
+            clk_cnt <= 0;
+        //i2c control clock, H: valid; L: valid
+        i2c_ctrl_clk <= ((clk_cnt >= (CLK_FREQ/I2C_FREQ)/4 + 1'b1) &&
+                        (clk_cnt < (3*CLK_FREQ/I2C_FREQ)/4 + 1'b1)) ? 1'b1 : 1'b0;
+        //send i2c data before, make sure that sdat is steady when i2c_sclk is valid
+        i2c_transfer_en <= (clk_cnt == 16'd0) ? 1'b1 : 1'b0;
+        //capture i2c data  while sdat is steady from cmos                  
+        i2c_capture_en <= (clk_cnt == (2*CLK_FREQ/I2C_FREQ)/4 - 1'b1) ? 1'b1 : 1'b0;
+        end
+    else
+        begin
+        clk_cnt <= 0;
+        i2c_ctrl_clk <= 0;
+        i2c_transfer_en <= 0;
+        i2c_capture_en <= 0;
+        end
+end
+
+//-----------------------------------------
+//I2C Timing state Parameter
+localparam  I2C_IDLE        =   4'd0;
+//Write I2C: {ID_Address, REG_Address, W_REG_Data}
+localparam  I2C_WR_START    =   4'd1;
+localparam  I2C_WR_IDADDR   =   4'd2;
+localparam  I2C_WR_ACK1     =   4'd3;
+localparam  I2C_WR_REGADDR1 =   4'd4;
+localparam  I2C_WR_ACK2     =   4'd5;
+localparam  I2C_WR_REGADDR2 =   4'd6;
+localparam  I2C_WR_ACK3     =   4'd7;
+localparam  I2C_WR_REGDATA  =   4'd8;
+localparam  I2C_WR_ACK4     =   4'd9;
+localparam  I2C_WR_STOP     =   4'd10;
+
+
+//-----------------------------------------
+// FSM: always1
+reg	[3:0]	current_state, next_state; //i2c write and read state  
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        current_state <= I2C_IDLE;
+    else if(i2c_transfer_en)
+        current_state <= next_state;
+end
+
+                                
+//-----------------------------------------
+wire    i2c_transfer_end = (current_state == I2C_WR_STOP) ? 1'b1 : 1'b0;
+reg     i2c_ack;    //i2c slave renpose successed
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        i2c_config_index <= 0;
+    else if(i2c_transfer_en)
+        begin
+		if(i2c_transfer_end & ~i2c_ack)
+//		if(i2c_transfer_end /*& ~i2c_ack*/)											//Just for test
+            begin
+            if(i2c_config_index < i2c_config_size)  
+                i2c_config_index <= i2c_config_index + 1'b1;
+//              i2c_config_index <= {i2c_config_index[7:1], ~i2c_config_index[0]};  //Just for test, Read Only
+            else
+                i2c_config_index <= i2c_config_size;
+            end
+        else
+            i2c_config_index <= i2c_config_index;
+        end
+    else
+        i2c_config_index <= i2c_config_index;
+end
+assign  i2c_config_done = (i2c_config_index == i2c_config_size) ? 1'b1 : 1'b0;
+
+
+//-----------------------------------------
+// FSM: always2
+reg [3:0]   i2c_stream_cnt; //i2c data bit stream count
+always@(*)
+begin
+    next_state = I2C_IDLE;  //state initialization
+    case(current_state)
+    I2C_IDLE:       //5'd0
+        begin
+        if(delay_done == 1'b1)  //1ms Setting time after software/hardware reset    
+            begin
+            if(i2c_transfer_en)
+                begin                
+                if(i2c_config_index < i2c_config_size)
+                    next_state = I2C_WR_START;  //Write Data to I2C
+                else// if(i2c_config_index >= i2c_config_size)
+                    next_state = I2C_IDLE;      //Config I2C Complete
+					 end
+            else
+                next_state = next_state;
+            end
+        else
+                next_state = I2C_IDLE;      //Wait I2C Bus is steady
+        end
+    //Write I2C: {ID_Address, REG_Address, W_REG_Data}
+    I2C_WR_START:   
+        if(i2c_transfer_en) next_state = I2C_WR_IDADDR;
+        else                next_state = I2C_WR_START;
+    I2C_WR_IDADDR:  
+        if(i2c_transfer_en == 1'b1 && i2c_stream_cnt == 4'd8)   
+                            next_state = I2C_WR_ACK1;
+        else                next_state = I2C_WR_IDADDR;
+    I2C_WR_ACK1:    
+        if(i2c_transfer_en) next_state = I2C_WR_REGADDR1;
+        else                next_state = I2C_WR_ACK1;        
+    I2C_WR_REGADDR1: 
+        if(i2c_transfer_en == 1'b1 && i2c_stream_cnt == 4'd8)   
+                            next_state = I2C_WR_ACK2;
+        else                next_state = I2C_WR_REGADDR1;
+    I2C_WR_ACK2:    
+        if(i2c_transfer_en) next_state = I2C_WR_REGADDR2;
+        else                next_state = I2C_WR_ACK2;
+    I2C_WR_REGADDR2: 
+        if(i2c_transfer_en == 1'b1 && i2c_stream_cnt == 4'd8)   
+                            next_state = I2C_WR_ACK3;
+        else                next_state = I2C_WR_REGADDR2;        
+    I2C_WR_ACK3:    
+        if(i2c_transfer_en) next_state = I2C_WR_REGDATA;
+        else                next_state = I2C_WR_ACK3;        
+    I2C_WR_REGDATA:    
+        if(i2c_transfer_en == 1'b1 && i2c_stream_cnt == 4'd8)   
+                            next_state = I2C_WR_ACK4;
+        else                next_state = I2C_WR_REGDATA;
+    I2C_WR_ACK4:    
+        if(i2c_transfer_en) next_state = I2C_WR_STOP;
+        else                next_state = I2C_WR_ACK4;
+
+    I2C_WR_STOP:    
+        if(i2c_transfer_en) next_state = I2C_IDLE;
+        else                next_state = I2C_WR_STOP;
+
+    default:;   //default vaule     
+    endcase
+end
+
+
+//-----------------------------------------
+// FSM: always3
+//reg   i2c_write_flag, i2c_read_flag;
+reg i2c_sdat_out;       //i2c data output
+//reg   [3:0]   i2c_stream_cnt; //i2c data bit stream count
+reg [7:0]   i2c_wdata;  //i2c data prepared to transfer
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        begin
+        i2c_sdat_out <= 1'b1;
+        i2c_stream_cnt <= 0;
+        i2c_wdata <= 0;
+        end
+    else if(i2c_transfer_en)
+        begin
+        case(next_state)
+        I2C_IDLE:   
+            begin
+            i2c_sdat_out <= 1'b1;       //idle state
+            i2c_stream_cnt <= 0;
+            i2c_wdata <= 0;
+            end
+        //Write I2C: {ID_Address, REG_Address, W_REG_Data}
+        I2C_WR_START:   
+            begin
+            i2c_sdat_out <= 1'b0;
+            i2c_stream_cnt <= 0;
+            i2c_wdata <= i2c_config_data[31:24];    //ID_Address
+            end
+        I2C_WR_IDADDR:  
+            begin
+            i2c_stream_cnt <= i2c_stream_cnt + 1'b1;
+            i2c_sdat_out <= i2c_wdata[3'd7 - i2c_stream_cnt];
+            end
+        I2C_WR_ACK1:    
+            begin
+            i2c_stream_cnt <= 0;
+            i2c_wdata <= i2c_config_data[23:16];        //REG_Address
+            end            
+        I2C_WR_REGADDR1: 
+            begin
+            i2c_stream_cnt <= i2c_stream_cnt + 1'b1;
+            i2c_sdat_out <= i2c_wdata[3'd7 - i2c_stream_cnt];
+            end
+        I2C_WR_ACK2:    
+            begin
+            i2c_stream_cnt <= 0;
+            i2c_wdata <= i2c_config_data[15:8];        //REG_Address
+            end
+        I2C_WR_REGADDR2: 
+            begin
+            i2c_stream_cnt <= i2c_stream_cnt + 1'b1;
+            i2c_sdat_out <= i2c_wdata[3'd7 - i2c_stream_cnt];
+            end         
+        I2C_WR_ACK3:    
+            begin
+            i2c_stream_cnt <= 0;
+            i2c_wdata <= i2c_config_data[7:0];     //W_REG_Data1
+            end            
+        I2C_WR_REGDATA:    
+            begin
+            i2c_stream_cnt <= i2c_stream_cnt + 1'b1;
+            i2c_sdat_out <= i2c_wdata[3'd7 - i2c_stream_cnt];
+            end
+        I2C_WR_ACK4:    
+            i2c_stream_cnt <= 0;
+
+        I2C_WR_STOP:    
+            i2c_sdat_out <= 1'b0;
+
+        endcase
+        end
+    else
+        begin
+        i2c_stream_cnt <= i2c_stream_cnt;
+        i2c_sdat_out <= i2c_sdat_out;
+        i2c_wdata <= i2c_wdata;
+        end
+end
+
+
+
+
+//---------------------------------------------
+//respone from slave for i2c data transfer
+reg i2c_ack1, i2c_ack2, i2c_ack3, i2c_ack4;
+always@(posedge clk or negedge rst_n)
+begin
+    if(!rst_n)
+        begin
+		{i2c_ack1, i2c_ack2, i2c_ack3, i2c_ack4} <= 4'b1111;
+        i2c_ack <= 1'b1;
+        end
+    else if(i2c_capture_en)
+        begin
+        case(next_state)
+        I2C_IDLE:
+        begin
+        {i2c_ack1, i2c_ack2, i2c_ack3, i2c_ack4} <= 4'b1111;
+        i2c_ack <= 1'b1;
+        end
+        //Write I2C: {ID_Address, REG_Address, W_REG_Data}
+        I2C_WR_ACK1:    i2c_ack1 <= i2c_sdat_i;
+        I2C_WR_ACK2:    i2c_ack2 <= i2c_sdat_i;
+        I2C_WR_ACK3:    i2c_ack3 <= i2c_sdat_i;
+        I2C_WR_ACK4:    i2c_ack4 <= i2c_sdat_i;
+        I2C_WR_STOP:    i2c_ack <= (i2c_ack1 | i2c_ack2 | i2c_ack3);// | i2c_ack4 );
+
+        default:;
+        endcase
+        end
+    else
+        begin
+        {i2c_ack1, i2c_ack2, i2c_ack3, i2c_ack4} <= {i2c_ack1, i2c_ack2, i2c_ack3, i2c_ack4};
+        i2c_ack <= i2c_ack;
+        end
+end 
+
+//---------------------------------------------------
+wire    bir_en =(   current_state == I2C_WR_ACK1 || current_state == I2C_WR_ACK2 || 
+	            current_state == I2C_WR_ACK3 || current_state == I2C_WR_ACK4) ? 1'b1 : 1'b0;
+assign  i2c_sclk = (current_state >= I2C_WR_IDADDR && current_state <= I2C_WR_ACK4) ? 
+                    i2c_ctrl_clk : 1'b1;
+//assign  i2c_sdat = (~bir_en) ? i2c_sdat_out : 1'bz;
+assign  i2c_sdat_o = i2c_sdat_out;
+assign  i2c_sdat_oe = ~bir_en;
+
+endmodule
+
+
+module Sdram_Control(
+		//	HOST Side
+        REF_CLK,		//sdram control clock
+		OUT_CLK,		//sdram	output clock
+        RESET_N,		//global clock reset
+		
+		//	FIFO Write Side 1
+        WR_DATA,
+		WR,
+		WR_MIN_ADDR,
+		WR_MAX_ADDR,
+		WR_LENGTH,
+		WR_LOAD,
+		WR_CLK,
+
+		//	FIFO Read Side 1
+        RD_DATA,
+		RD,
+		RD_MIN_ADDR,
+		RD_MAX_ADDR,
+		RD_LENGTH,
+		RD_LOAD,	
+		RD_CLK,
+
+		//	SDRAM Side
+        SA,
+        BA,
+        CS_N,
+        CKE,
+        RAS_N,
+        CAS_N,
+        WE_N,
+        sdram_data_IN,
+        sdram_data_OUT,
+        sdram_data_OE,
+        DQM,
+		SDR_CLK,
+		
+		//User interface add by CrazyBingo
+		Sdram_Init_Done,		//SDRAM Init done signal
+		Sdram_Read_Valid,		//SDRAM Read valid : output
+		Sdram_PingPong_EN		//SDRAM PING-PONG operation enable
+        );
+
+`include    "Sdram_Params.h"
+
+
+//	HOST Side
+input                           REF_CLK;                //sdram control clock
+input                           OUT_CLK;                //sdram output clock
+input                           RESET_N;                //System Reset
+//	FIFO Write Side 1
+input   [`DSIZE-1:0]            WR_DATA;               //Data input
+input							WR;					//Write Request
+input	[`ASIZE-1:0]			WR_MIN_ADDR;				//Write start address
+input	[`ASIZE-1:0]			WR_MAX_ADDR;			//Write max address
+input	[8:0]					WR_LENGTH;				//Write length
+input							WR_LOAD;				//Write register load & fifo clear
+input							WR_CLK;				//Write fifo clock
+//	FIFO Read Side 1
+output  [`DSIZE-1:0]            RD_DATA;               //Data output
+input							RD;					//Read Request
+input	[`ASIZE-1:0]			RD_MIN_ADDR;				//Read start address
+input	[`ASIZE-1:0]			RD_MAX_ADDR;			//Read max address
+input	[8:0]					RD_LENGTH;				//Read length
+input							RD_LOAD;				//Read register load & fifo clear
+input							RD_CLK;				//Read fifo clock
+//	SDRAM Side
+output  [`ROWSIZE -1:0]         SA;                     //SDRAM address output
+output  [1:0]                   BA;                     //SDRAM bank address
+output  	                    CS_N;                   //SDRAM Chip Selects
+output                          CKE;                    //SDRAM clock enable
+output                          RAS_N;                  //SDRAM Row address Strobe
+output                          CAS_N;                  //SDRAM Column address Strobe
+output                          WE_N;                   //SDRAM write enable
+input  [`DSIZE-1:0]             sdram_data_IN;
+output [`DSIZE-1:0]             sdram_data_OUT;
+output [`DSIZE-1:0]             sdram_data_OE;
+output  [`DSIZE/8-1:0]          DQM;                    //SDRAM data mask lines
+output							SDR_CLK;				//SDRAM clock
+
+
+//User interface add by CrazyBingo
+output							Sdram_Init_Done;		//SDRAM Init done signal
+input							Sdram_Read_Valid;		//SDRAM Read valid : output
+input							Sdram_PingPong_EN;		//SDRAM PING-PONG operation enable
+
+
+
+
+//	Internal Registers/Wires
+//	Controller
+reg		[`ASIZE-1:0]			mADDR;					//Internal address
+reg		[8:0]					mLENGTH;				//Internal length
+reg		[`ASIZE-1:0]			rWR_ADDR;				//Register write address				
+reg		[`ASIZE-1:0]			rRD_ADDR;				//Register read address
+reg								WR_MASK;				//Write port active mask
+reg								RD_MASK;				//Read port active mask
+reg								mWR_DONE;				//Flag write done, 1 pulse SDR_CLK
+reg								mRD_DONE;				//Flag read done, 1 pulse SDR_CLK
+reg								mWR,Pre_WR;				//Internal WR edge capture
+reg								mRD,Pre_RD;				//Internal RD edge capture
+reg 	[9:0] 					ST;						//Controller status
+reg		[1:0] 					CMD;					//Controller command
+reg								PM_STOP;				//Flag page mode stop
+reg								PM_DONE;				//Flag page mode done
+reg								Read;					//Flag read active
+reg								Write;					//Flag write active
+reg	    [`DSIZE-1:0]           	mDATAOUT;               //Controller Data output
+wire    [`DSIZE-1:0]           	mDATAIN;                //Controller Data input
+wire    [`DSIZE-1:0]           	mDATAIN1;                //Controller Data input 1
+wire                          	CMDACK;                 //Controller command acknowledgement
+
+//	DRAM Control
+reg  	[`DSIZE/8-1:0]          DQM;                    //SDRAM data mask lines
+reg     [`ROWSIZE -1:0]         SA;                     //SDRAM address output
+reg     [1:0]                   BA;                     //SDRAM bank address
+reg     		                CS_N;                   //SDRAM Chip Selects
+reg                             CKE;                    //SDRAM clock enable
+reg                             RAS_N;                  //SDRAM Row address Strobe
+reg                             CAS_N;                  //SDRAM Column address Strobe
+reg                             WE_N;                   //SDRAM write enable
+wire    [`DSIZE-1:0]            DQOUT;					//SDRAM data out link
+//wire  	[`DSIZE/8-1:0]          IDQM;                   //SDRAM data mask lines
+wire    [`ROWSIZE -1:0]         ISA;                    //SDRAM address output
+wire    [1:0]                   IBA;                    //SDRAM bank address
+wire    	                    ICS_N;                  //SDRAM Chip Selects
+wire                            ICKE;                   //SDRAM clock enable
+wire                            IRAS_N;                 //SDRAM Row address Strobe
+wire                            ICAS_N;                 //SDRAM Column address Strobe
+wire                            IWE_N;                  //SDRAM write enable
+//	FIFO Control
+reg								OUT_VALID;				//Output data request to read side fifo
+reg								IN_REQ;					//Input	data request to write side fifo
+wire	[8:0]					write_side_fifo_rusedw1;
+wire	[8:0]					read_side_fifo_wusedw1;
+
+
+//	DRAM Internal Control
+wire    [`ASIZE-1:0]            saddr;
+wire                            load_mode;
+wire                            nop;
+wire                            reada;
+wire                            writea;
+wire                            refresh;
+wire                            precharge;
+wire                            oe;
+wire							ref_ack;
+wire							ref_req;
+wire							init_req;
+wire							cm_ack;
+
+assign SDR_CLK = OUT_CLK;		//sdram output clock
+
+control_interface control1 (
+                .CLK			(REF_CLK),
+                .RESET_N		(RESET_N),
+                .CMD			(CMD),
+                .ADDR			(mADDR),
+                .REF_ACK		(ref_ack),
+                .CM_ACK			(cm_ack),
+                .NOP			(nop),
+                .READA			(reada),
+                .WRITEA			(writea),
+                .REFRESH		(refresh),
+                .PRECHARGE		(precharge),
+                .LOAD_MODE		(load_mode),
+                .SADDR			(saddr),
+                .REF_REQ		(ref_req),
+				.INIT_REQ		(init_req),
+                .CMD_ACK		(CMDACK),
+				.Sdram_Init_Done(Sdram_Init_Done)
+                );
+
+command command1(
+                .CLK			(REF_CLK),
+                .RESET_N		(RESET_N),
+                .SADDR			(saddr),
+                .NOP			(nop),
+                .READA			(reada),
+                .WRITEA			(writea),
+                .REFRESH		(refresh),
+				.LOAD_MODE		(load_mode),
+                .PRECHARGE		(precharge),
+                .REF_REQ		(ref_req),
+				.INIT_REQ		(init_req),
+                .REF_ACK		(ref_ack),
+                .CM_ACK			(cm_ack),
+                .OE				(oe),
+				.PM_STOP		(PM_STOP),
+				.PM_DONE		(PM_DONE),
+                .SA				(ISA),
+                .BA				(IBA),
+                .CS_N			(ICS_N),
+                .CKE			(ICKE),
+                .RAS_N			(IRAS_N),
+                .CAS_N			(ICAS_N),
+                .WE_N			(IWE_N)
+                );
+                
+//sdr_data_path data_path1(
+//                .CLK			(REF_CLK),
+//                .RESET_N		(RESET_N),
+//                .DATAIN			(mDATAIN),
+//                .DM				({(`DSIZE/8){1'b0}}),
+//                .DQOUT			(DQOUT),
+//                .DQM			(IDQM)
+//                );
+
+write_fifo	u_write_fifo1(
+				.wdata			(WR_DATA),
+				.wr_en_i			(WR),
+				.wr_clk_i			(WR_CLK),
+				.a_rst_i			(~RESET_N | WR_LOAD),
+				.rd_en_i			(IN_REQ & WR_MASK),
+				.rd_clk_i			(REF_CLK),
+				.rdata				(mDATAIN1),
+				.rd_datacount_o		(write_side_fifo_rusedw1)
+				);
+
+				
+assign	mDATAIN	= (WR_MASK) ? mDATAIN1 : {`DSIZE-1{1'b1}};
+
+read_fifo 	u_read_fifo1(
+				.wdata			    (mDATAOUT),
+				.wr_en_i			(OUT_VALID & RD_MASK),
+				.wr_clk_i			(REF_CLK),
+				.a_rst_i			(~RESET_N | RD_LOAD),
+				.rd_en_i			(RD),
+				.rd_clk_i			(RD_CLK),
+				.rdata				(RD_DATA),
+				.wr_datacount_o		(read_side_fifo_wusedw1)
+				);
+				
+
+always @(posedge REF_CLK)
+begin
+	SA      <= (ST==SC_CL+mLENGTH)			?	`ROWSIZE'h200	:	ISA;
+    BA      <= IBA;
+    CS_N    <= ICS_N;
+    CKE     <= ICKE;
+    RAS_N   <= (ST==SC_CL+mLENGTH)			?	1'b0	:	IRAS_N;
+    CAS_N   <= (ST==SC_CL+mLENGTH)			?	1'b1	:	ICAS_N;
+    WE_N    <= (ST==SC_CL+mLENGTH)			?	1'b0	:	IWE_N;
+	PM_STOP	<= (ST==SC_CL+mLENGTH)			?	1'b1	:	1'b0;
+	PM_DONE	<= (ST==SC_CL+SC_RCD+mLENGTH+2)	?	1'b1	:	1'b0;
+	DQM		<= {(`DSIZE/8){1'b0}};	//( active && (ST>=SC_CL) )	?	(((ST==SC_CL+mLENGTH) && Write) ? {(`DSIZE/8){1'b1}} : {(`DSIZE/8){1'b0}}) : {(`DSIZE/8){1'b1}};
+	mDATAOUT<= sdram_data_IN;
+end
+//wire	active	=	Read | Write;
+assign	DQOUT = mDATAIN;
+//assign  DQ = oe ? DQOUT : `DSIZE'hzzzz;
+
+assign  sdram_data_OUT = DQOUT;//oe ? DQOUT : `DSIZE'hz;
+assign  sdram_data_OE = {16{oe}} ;   
+
+
+
+always@(posedge REF_CLK or negedge RESET_N)
+begin
+	if(RESET_N==0)
+		begin
+		CMD			<=  0;
+		ST			<=  0;
+		Pre_RD		<=  0;
+		Pre_WR		<=  0;
+		Read		<=	0;
+		Write		<=	0;
+		OUT_VALID	<=	0;
+		IN_REQ		<=	0;
+		mWR_DONE	<=	0;
+		mRD_DONE	<=	0;
+		end
+	else
+		begin
+		Pre_RD	<=	mRD;
+		Pre_WR	<=	mWR;
+		case(ST)
+		0:	begin
+			if({Pre_RD,mRD}==2'b01)
+				begin
+				Read	<=	1;
+				Write	<=	0;
+				CMD		<=	2'b01;
+				ST		<=	1;
+				end
+			else if({Pre_WR,mWR}==2'b01)
+				begin
+				Read	<=	0;
+				Write	<=	1;
+				CMD		<=	2'b10;
+				ST		<=	1;
+				end
+			end
+		1:	begin
+			if(CMDACK==1)
+				begin
+				CMD<=2'b00;
+				ST<=2;
+				end
+			end
+		default:	
+			begin	
+			if(ST!=SC_CL+SC_RCD+mLENGTH+1)
+				ST<=ST+1'b1;
+			else
+				ST<=0;
+			end
+		endcase
+	
+		if(Read)	//read done
+			begin
+			if(ST==SC_CL+SC_RCD+1)
+				OUT_VALID	<=	1;
+			else if(ST==SC_CL+SC_RCD+mLENGTH+1)
+				begin
+				OUT_VALID	<=	0;
+				Read		<=	0;
+				mRD_DONE	<=	1;
+				end
+			end
+		else
+			mRD_DONE	<=	0;
+		
+		if(Write)	//write done
+			begin
+			if(ST==SC_CL-1)
+				IN_REQ	<=	1;
+			else if(ST==SC_CL+mLENGTH-1)
+				IN_REQ	<=	0;
+			else if(ST==SC_CL+SC_RCD+mLENGTH)
+				begin
+				Write	<=	0;
+				mWR_DONE<=	1;
+				end
+			end
+		else
+			mWR_DONE<=	0;
+
+	end
+end
+
+
+//------------------------------------------------------------------------------------------------
+//	Internal Address & Length Control for Write
+wire	[`ASIZE-1:0]	WR_MIN_ADDR1 = WR_MIN_ADDR;
+wire	[`ASIZE-1:0]	WR_MAX_ADDR1 = WR_MAX_ADDR;
+wire	[`ASIZE-1:0]	WR_MIN_ADDR2 = {~WR_MIN_ADDR[`ASIZE-1], WR_MIN_ADDR[`ASIZE-2:0]};	//Ping-Pong1 operation
+wire	[`ASIZE-1:0]	WR_MAX_ADDR2 = {~WR_MAX_ADDR[`ASIZE-1], WR_MAX_ADDR[`ASIZE-2:0]};	//Ping-Pong2 operation
+wire	PINGPONG1_WRADDR1 = (rWR_ADDR >=  WR_MIN_ADDR1 && rWR_ADDR <= WR_MAX_ADDR1 - WR_LENGTH) ? 1'b1 : 1'b0;
+wire	PINGPONG1_WRADDR2 = (rWR_ADDR >=  WR_MIN_ADDR2 && rWR_ADDR <= WR_MAX_ADDR2 - WR_LENGTH) ? 1'b1 : 1'b0;
+always@(posedge REF_CLK or negedge RESET_N)
+begin
+	if(!RESET_N)
+		rWR_ADDR <= WR_MIN_ADDR1;
+	else if(WR_LOAD)
+		rWR_ADDR <= WR_MIN_ADDR1;
+	else if(mWR_DONE & WR_MASK)						//While 1 page write has done
+		begin
+		//Bank 0-1 for Ping-Pong1
+		if(PINGPONG1_WRADDR1 == 1'b1)
+			begin
+			if(rWR_ADDR < WR_MAX_ADDR1 - WR_LENGTH)
+				rWR_ADDR	<=	rWR_ADDR + WR_LENGTH;
+			else
+				begin
+				if(Sdram_PingPong_EN)				//SDRAM PING-PONG operation enable
+					rWR_ADDR	<=	WR_MIN_ADDR2;	//Go to Ping-Pong2
+				else
+					rWR_ADDR	<=	WR_MIN_ADDR1;	//Remain Ping-Pong1
+				end
+			end
+		//Bank 2-3 for Ping-Pong2
+		if(PINGPONG1_WRADDR2 == 1'b1)
+			begin
+			if(rWR_ADDR < WR_MAX_ADDR2 - WR_LENGTH)
+				rWR_ADDR	<=	rWR_ADDR + WR_LENGTH;
+			else
+				begin
+				if(Sdram_PingPong_EN)				//SDRAM PING-PONG operation enable
+					rWR_ADDR	<=	WR_MIN_ADDR1;	//Go to Ping-Pong1	
+				else
+					rWR_ADDR	<=	WR_MIN_ADDR2;	//Remain Ping-Pong2
+				end	
+			end
+		end
+	else
+		rWR_ADDR <= rWR_ADDR;
+end
+
+
+//------------------------------------------------------------------------------------------------
+//	Internal Address & Length Control for Read; If enable Ping-Pong operation, Read should switch the address
+wire	[`ASIZE-1:0]	RD_MIN_ADDR1 = RD_MIN_ADDR;
+wire	[`ASIZE-1:0]	RD_MAX_ADDR1 = RD_MAX_ADDR;
+wire	[`ASIZE-1:0]	RD_MIN_ADDR2 = {~RD_MIN_ADDR[`ASIZE-1], RD_MIN_ADDR[`ASIZE-2:0]};	//Ping-Pong1 operation
+wire	[`ASIZE-1:0]	RD_MAX_ADDR2 = {~RD_MAX_ADDR[`ASIZE-1], RD_MAX_ADDR[`ASIZE-2:0]};	//Ping-Pong2 operation
+wire	PINGPONG1_RDADDR1 = (rRD_ADDR >=  RD_MIN_ADDR1 && rRD_ADDR <= RD_MAX_ADDR1 - RD_LENGTH) ? 1'b1 : 1'b0;
+wire	PINGPONG1_RDADDR2 = (rRD_ADDR >=  RD_MIN_ADDR2 && rRD_ADDR <= RD_MAX_ADDR2 - RD_LENGTH) ? 1'b1 : 1'b0;
+always@(posedge REF_CLK or negedge RESET_N)
+begin
+	if(!RESET_N)
+		begin	
+		if(Sdram_PingPong_EN)							//SDRAM PING-PONG operation enable			
+			rRD_ADDR <= RD_MIN_ADDR2;
+		else
+			rRD_ADDR <= RD_MIN_ADDR1;
+		end
+	else if(RD_LOAD)
+		begin
+		if(Sdram_PingPong_EN)							//SDRAM PING-PONG operation enable			
+			rRD_ADDR <= RD_MIN_ADDR2;
+		else
+			rRD_ADDR <= RD_MIN_ADDR1;
+		end
+	else if(mRD_DONE & RD_MASK)							//While 1 page read has done
+		begin
+		//Bank 0-1 for Ping-Pong1
+		if(PINGPONG1_RDADDR1 == 1'b1)
+			begin
+			if(rRD_ADDR < RD_MAX_ADDR1 - RD_LENGTH)
+				rRD_ADDR	<=	rRD_ADDR + RD_LENGTH;
+			else
+				begin
+				if(Sdram_PingPong_EN)					//SDRAM PING-PONG operation enable	
+					begin
+					if(PINGPONG1_WRADDR1 == 1'b1)
+						rRD_ADDR	<=	RD_MIN_ADDR2;	//Go to Ping-Pong2
+					else if(PINGPONG1_WRADDR2 == 1'b1)
+						rRD_ADDR	<=	RD_MIN_ADDR1;	//Remain Ping-Pong1
+					end
+				else
+					rRD_ADDR	<=	RD_MIN_ADDR1;		//Steady Ping-Pong1
+				end
+			end
+		//Bank 2-3 for Ping-Pong2
+		if(PINGPONG1_RDADDR2 == 1'b1)		
+			begin
+			if(rRD_ADDR < RD_MAX_ADDR2 - RD_LENGTH)
+				rRD_ADDR	<=	rRD_ADDR + RD_LENGTH;
+			else
+				begin
+				if(Sdram_PingPong_EN)					//SDRAM PING-PONG operation enable	
+					begin
+					if(PINGPONG1_WRADDR1 == 1'b1)
+						rRD_ADDR	<=	RD_MIN_ADDR2;	//Remain Ping-Pong2
+					else if(PINGPONG1_WRADDR2 == 1'b1)
+						rRD_ADDR	<=	RD_MIN_ADDR1;	//Go to Ping-Pong1
+					end
+				else
+					rRD_ADDR	<=	RD_MIN_ADDR2;		//Steady Ping-Pong2
+				end
+			end
+		end
+	else
+		rRD_ADDR <= rRD_ADDR;
+end
+
+
+//---------------------------------------------------------------------------------------------------
+//	Auto Read/Write Control
+always@(posedge REF_CLK or negedge RESET_N)
+begin
+	if(!RESET_N)
+		begin
+		mWR		<=	0;
+		mRD		<=	0;
+		mADDR	<=	0;
+		mLENGTH	<=	0;
+		WR_MASK	<= 	0;
+		RD_MASK	<= 	0;
+		end
+	else
+		begin
+		if((mWR==0) && (mRD==0) && (ST==0) && (WR_MASK==0) && (RD_MASK==0))	//free
+			begin	
+			//	Write Side 1 is most important
+			if( (write_side_fifo_rusedw1 >= WR_LENGTH) && (WR_LOAD==0))	//write fifo
+				begin
+				mADDR	<=	rWR_ADDR;
+				mLENGTH	<=	WR_LENGTH;
+				WR_MASK	<=	1;
+				RD_MASK	<=	0;
+				mWR		<=	1;
+				mRD		<=	0;
+				end
+			else if((read_side_fifo_wusedw1 < RD_LENGTH) && (RD_LOAD==0) && (Sdram_Read_Valid == 1'b1))	//read fifo
+				begin
+				mADDR	<=	rRD_ADDR;
+				mLENGTH	<=	RD_LENGTH;
+				WR_MASK	<=	0;
+				RD_MASK	<=	1;
+				mWR		<=	0;
+				mRD		<=	1;				
+				end
+			end
+		if(mWR_DONE)	//write sdram done
+			begin
+			WR_MASK	<=	0;
+			mWR		<=	0;
+			end
+		if(mRD_DONE)	//read sdram done
+			begin
+			RD_MASK	<=	0;
+			mRD		<=	0;
+			end
+	end
+end
+
+endmodule
